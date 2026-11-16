@@ -126,6 +126,43 @@ class Database:
         )
         await self.db.commit()
 
+    async def transition(
+        self,
+        batch_id: str,
+        status: BatchStatus,
+        *,
+        allowed_from: tuple[BatchStatus, ...],
+        error: Optional[str] = None,
+        started: bool = False,
+        finished: bool = False,
+    ) -> bool:
+        """条件状态迁移：仅当当前状态属于 allowed_from 时才更新，返回是否生效。
+
+        取消接口与 worker 启动都用它做原子迁移，避免“读取状态 → 写状态”
+        之间的竞态（例如取消到达时批次刚好完成，或批次刚好开始执行）。
+        """
+        sets = ["status = ?"]
+        params: list[Any] = [status.value]
+        if error is not None:
+            sets.append("error = ?")
+            params.append(error)
+        if started:
+            sets.append("started_at = ?")
+            params.append(_iso(utcnow()))
+        if finished:
+            sets.append("finished_at = ?")
+            params.append(_iso(utcnow()))
+        placeholders = ",".join("?" for _ in allowed_from)
+        params.append(batch_id)
+        params.extend(s.value for s in allowed_from)
+        cursor = await self.db.execute(
+            f"UPDATE batches SET {', '.join(sets)} "
+            f"WHERE id = ? AND status IN ({placeholders})",
+            params,
+        )
+        await self.db.commit()
+        return cursor.rowcount == 1
+
     async def mark_unfinished_interrupted(self) -> list[str]:
         """服务重启恢复：所有未完成批次标记为 INTERRUPTED，保留已完成读数。"""
         placeholders = ",".join("?" for _ in (

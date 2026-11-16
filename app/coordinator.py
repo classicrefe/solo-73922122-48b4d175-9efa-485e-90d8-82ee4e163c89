@@ -44,6 +44,9 @@ class Coordinator:
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._resync_task: Optional[asyncio.Task[None]] = None
         self._cancel_events: dict[str, asyncio.Event] = {}
+        # 执行中取消派生的带外 ABORt 任务，按批次跟踪：
+        # worker 收尾前必须等待它落地，否则迟到的 ABORt 会中止下一批的扫描
+        self._cancel_abort_tasks: dict[str, asyncio.Task[None]] = {}
         self._instrument_lock = asyncio.Lock()
 
         self.synced = False
@@ -68,6 +71,8 @@ class Coordinator:
     async def shutdown(self) -> None:
         self._stopping = True
         self.sync_event.set()  # 解除 worker 等待
+        for task in self._cancel_abort_tasks.values():
+            task.cancel()
         for task in (self._worker_task, self._resync_task):
             if task:
                 task.cancel()
@@ -75,6 +80,7 @@ class Coordinator:
                     await task
         self._worker_task = None
         self._resync_task = None
+        self._cancel_abort_tasks.clear()
 
     # ---- 入队 / 取消 / 接续 ------------------------------------------
 
@@ -92,26 +98,43 @@ class Coordinator:
                 "found": True, "accepted": False, "status": status,
                 "message": f"批次已处于终态 {status.value}，不可取消",
             }
-        if status == BatchStatus.QUEUED:
-            # 排队中：立即取消，worker 弹出后跳过，绝不触发仪器
-            await self.db.update_status(batch_id, BatchStatus.CANCELLED, finished=True)
+        if status == BatchStatus.CANCELLING:
+            # CANCELLING 幂等
+            self._event_for(batch_id).set()
+            return {"found": True, "accepted": True, "status": BatchStatus.CANCELLING,
+                    "message": "取消已在处理中"}
+        # 排队中：原子 QUEUED -> CANCELLED，worker 弹出后跳过，绝不触发仪器。
+        # 条件更新保证与 worker 启动迁移（QUEUED -> RUNNING）竞争时必有一方落败。
+        if await self.db.transition(
+                batch_id, BatchStatus.CANCELLED,
+                allowed_from=(BatchStatus.QUEUED,), finished=True):
             self._event_for(batch_id).set()
             logger.info("批次 %s 排队中取消，不再触发仪器", batch_id)
             return {"found": True, "accepted": True, "status": BatchStatus.CANCELLED,
                     "message": "取消已受理：批次尚未执行，已移出队列"}
-        if status == BatchStatus.RUNNING:
-            await self.db.update_status(batch_id, BatchStatus.CANCELLING)
+        # 执行中：原子 RUNNING -> CANCELLING，经独立连接立即发 ABORt。
+        # ABORt 任务登记在案，worker 收尾前会等待它落地，
+        # 避免迟到的 ABORt 漏到下一批的扫描上。
+        if await self.db.transition(
+                batch_id, BatchStatus.CANCELLING,
+                allowed_from=(BatchStatus.RUNNING,)):
             event = self._event_for(batch_id)
             event.set()
-            # 独立连接立即发 ABORt，不阻塞取消响应
-            asyncio.create_task(self._abort_for_cancel(batch_id))
+            task = asyncio.create_task(self._abort_for_cancel(batch_id))
+            self._cancel_abort_tasks[batch_id] = task
             logger.info("批次 %s 执行中取消已受理（CANCELLING）", batch_id)
             return {"found": True, "accepted": True, "status": BatchStatus.CANCELLING,
                     "message": "取消已受理：正在停止仪器扫描"}
-        # CANCELLING 幂等
-        self._event_for(batch_id).set()
-        return {"found": True, "accepted": True, "status": BatchStatus.CANCELLING,
-                "message": "取消已在处理中"}
+        # 与 worker 的状态迁移照片冲线（如读取后刚好完成）：按最新状态回复
+        batch = await self.db.get_batch(batch_id)
+        assert batch is not None
+        status = BatchStatus(batch["status"])
+        if status == BatchStatus.CANCELLING:
+            self._event_for(batch_id).set()
+            return {"found": True, "accepted": True, "status": status,
+                    "message": "取消已在处理中"}
+        return {"found": True, "accepted": False, "status": status,
+                "message": f"批次已处于终态 {status.value}，不可取消"}
 
     async def resume(self, batch_id: str) -> bool:
         batch = await self.db.get_batch(batch_id)
@@ -137,6 +160,20 @@ class Coordinator:
             logger.warning("批次 %s 取消 ABORt 发送失败（将由停机确认重试）: %s",
                            batch_id, exc)
 
+    async def _await_cancel_abort(self, batch_id: str) -> None:
+        """等待本批取消派生的带外 ABORt 任务落地。
+
+        worker 是串行的：本方法在 _run_batch 收尾（finally）中执行，
+        保证任务在下一批启动前结束，迟到的 ABORt 不会中止下一批的扫描。
+        """
+        task = self._cancel_abort_tasks.pop(batch_id, None)
+        if task is None:
+            return
+        try:
+            await task
+        except Exception:  # noqa: BLE001 - 任务异常不阻断批次收尾
+            logger.warning("批次 %s 的取消 ABORt 任务异常", batch_id, exc_info=True)
+
     # ---- worker 主循环 -----------------------------------------------
 
     async def _worker(self) -> None:
@@ -154,6 +191,11 @@ class Coordinator:
                     logger.info("批次 %s 状态为 %s，跳过（排队期间已取消）",
                                 batch_id, batch["status"])
                     continue
+                # 弹出后、执行前再次确认仍处于已同步状态：
+                # 停机确认/迟到响应清理未完成（未同步）时不得启动下一批
+                await self.sync_event.wait()
+                if self._stopping:
+                    break
                 self._current_batch = batch_id
                 await self._run_batch(batch_id, batch["channels"])
             except asyncio.CancelledError:
@@ -176,7 +218,14 @@ class Coordinator:
     async def _run_batch(self, batch_id: str, channels: list[int]) -> None:
         event = self._event_for(batch_id)
         try:
-            await self.db.update_status(batch_id, BatchStatus.RUNNING, started=True)
+            # 原子 QUEUED -> RUNNING：与“排队取消”竞争时必有一方落败，
+            # 避免已取消批次被置回 RUNNING 的僵尸执行
+            if not await self.db.transition(
+                    batch_id, BatchStatus.RUNNING,
+                    allowed_from=(BatchStatus.QUEUED,), started=True):
+                logger.info("批次 %s 启动前已离开 QUEUED（排队期间已取消），跳过",
+                            batch_id)
+                return
             logger.info("批次 %s 开始执行，通道 %s", batch_id, channels)
 
             async with self._instrument_lock:
@@ -237,9 +286,17 @@ class Coordinator:
                             batch_id, len(values), values)
         except ScpiError as exc:
             if event.is_set():
-                # 取消路径上的通信异常（含停机确认失败）：按取消收口，不判失败
-                with contextlib.suppress(ScpiError):
+                # 取消路径上的通信异常：取消仍然成立（读数不保存）。
+                # 但若连停机确认都打不通仪器，必须标记未同步并进入重同步，
+                # 在确认仪器停止、清掉迟到响应之前不得启动下一批。
+                try:
                     await self._abort_and_drain("取消收口")
+                except ScpiError as drain_exc:
+                    logger.error(
+                        "批次 %s 取消时无法确认仪器停止: %s；"
+                        "标记未同步，后续批次排队等待重同步", batch_id, drain_exc)
+                    self._begin_resync(
+                        f"批次 {batch_id} 取消时停机确认失败: {drain_exc.message}")
                 await self._finish_cancelled(batch_id)
                 return
             logger.error("批次 %s 执行失败: %s", batch_id, exc)
@@ -250,6 +307,9 @@ class Coordinator:
                     error=f"仪器通信失败: {exc.message}", finished=True)
             self._begin_resync(f"批次 {batch_id} 通信失败: {exc.message}")
         finally:
+            # 取消派生的带外 ABORt 必须在本批收尾前落地：
+            # 迟到的 ABORt 若漏到下一批，会把下一批的扫描中止（scan aborted）
+            await self._await_cancel_abort(batch_id)
             self._cancel_events.pop(batch_id, None)
 
     async def _finish_cancelled(self, batch_id: str) -> None:
